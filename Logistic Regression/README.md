@@ -67,3 +67,10 @@ To plot the Receiver Operating Characteristic (ROC) curve via the ROCR package, 
 * Substantial Lift Over Baseline: The model achieved 82.4% accuracy, outperforming the baseline rule (61.5%) by +20.9%, confirming that socio-demographic features hold strong predictive capability.
 * Historical Validation: Statistical coefficients strongly corroborate the historical "women and children first" protocol and socio-economic priority during evacuation.
 * Missing Data Impact: Deleting observations with missing age values significantly reduces training size and predictive resolution, highlighting the importance of imputation strategies in future iterations.
+
+---
+
+## Required R Libraries
+* "readr",    # Data loading
+* "caTools",  # Train/Test data splitting
+* "ROCR"      # ROC curve generation and AUC evaluation
