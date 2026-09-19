@@ -1,0 +1,278 @@
+---
+title: "Random Forests & Gradient Boosting"
+author: "Michail Ioannidis"
+date: "2026-05-09"
+output: 
+  cleanrmd::html_document_clean:
+    theme: water-dark
+    toc: true
+    toc_float: true
+---
+
+```{r}
+# ============================================================
+#  LAB 010 — Random Forests & Gradient Boosting
+#  Dataset: Breast Cancer (Wisconsin)
+#  Στόχος: Πρόβλεψη κακοήθειας από κυτταρολογικά χαρακτηριστικά
+# ============================================================
+
+# --- Φόρτωση πακέτων ---
+library(tidyverse)
+library(mlbench)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(pROC)
+```
+
+```{r}
+set.seed(42)
+
+# --- Φόρτωση δεδομένων ---
+data("BreastCancer", package = "mlbench")
+bc <- BreastCancer
+
+# Καθαρισμός: αφαίρεση ID, χειρισμός missing, μετατροπή σε numeric
+bc$Id <- NULL
+bc <- na.omit(bc)
+bc[, 1:9] <- lapply(bc[, 1:9], function(x) as.numeric(as.character(x)))
+
+str(bc)
+table(bc$Class)
+```
+
+#  ΜΕΡΟΣ Α — BASELINE με Random Forest
+
+## Αρχική διερεύνηση dataset
+
+1. **Cl.thickness (Clump Thickness)**: Πάχος ομάδων κυττάρων. Τα καλοήθη κύτταρα είναι σε μονές στρώσεις, τα καρκινικά σχηματίζουν παχιά «στοιβάδια».
+
+2. **Cell.size & Cell.shape**: Ομοιομορφία μεγέθους και σχήματος. Τα καρκινικά κύτταρα έχουν χάσει τον έλεγχο και το καθένα έχει διαφορετικό μέγεθος και παράξενο σχήμα.
+
+3. **Marg.adhesion (Marginal Adhesion)**: Τα υγιή κύτταρα «κολλούν» μεταξύ τους. Τα καρκινικά χάνουν αυτή την ιδιότητα, γι' αυτό μπορούν να αποκολληθούν και να κάνουν μεταστάσεις.
+
+4. **Epith.c.size (Epithelial Cell Size)**: Μέγεθος επιθηλιακού κυττάρου. Αν είναι πολύ διογκωμένο, είναι ύποπτο.
+
+5. **Bare.nuclei (Γυμνοί Πυρήνες)**: Πυρήνες που δεν περιβάλλονται από κυτταρόπλασμα. Είναι από τους πιο ισχυρούς δείκτες κακοήθειας.
+
+6. **Bl.cromatin (Bland Chromatin)**: Η υφή του πυρήνα. Στα καρκινικά κύτταρα, η χρωματίνη φαίνεται πιο «τραχιά» ή σε σβώλους.
+
+7. **Normal.nucleoli**: Μικρές δομές μέσα στον πυρήνα. Στα καρκινικά κύτταρα γίνονται πολύ μεγάλα και πολλά.
+
+8. **Mitoses (Μιτώσεις)**: Ο ρυθμός διαίρεσης των κυττάρων. Ο καρκίνος χαρακτηρίζεται από ασταμάτητες διαιρέσεις.
+
+9. **Class**: Η μεταβλητή-στόχος (benign = καλοήθης, malignant = κακοήθης).
+
+```{r}
+# --- Βασικά Στατιστικά ---
+summary(bc)
+
+# Πρώτες 6 γραμμές dataset
+head(bc)
+```
+
+## stratified train/test split (70/30)
+
+```{r}
+#createDataPartition() από το caret
+# Χρησιμοποιούμε το stratified split για να έχουμε την ίδια αναλογία 
+# καλοήθων/κακοήθων και στα δύο σύνολα.
+
+set.seed(42) # Για να είναι αναπαράξιμα τα αποτελέσματα
+train_index <- createDataPartition(bc$Class, p = 0.7, list = FALSE)
+
+train_set <- bc[train_index, ]
+test_set  <- bc[-train_index, ]
+
+# Έλεγχος αν η αναλογία παρέμεινε η ίδια
+prop.table(table(train_set$Class))
+prop.table(table(test_set$Class))
+```
+
+## Εκπαιδεύουμε ένα Random Forest με ntree=500, importance=TRUE
+
+```{r}
+# Στόχος: μοντέλο που προβλέπει το Class
+# ntree=500: Φτιάχνουμε 500 δέντρα
+# importance=TRUE: Ζητάμε από το μοντέλο να μας πει ποια χαρακτηριστικά
+# είναι τα πιο σημαντικά για τη διάγνωση.
+
+rf_model <- randomForest(Class ~ ., 
+                         data = train_set, 
+                         ntree = 500, 
+                         importance = TRUE)
+```
+
+## Υπολογίζουμε Accuracy, Sensitivity, AUC στο test set
+
+```{r}
+# confusionMatrix() + roc()
+# 1. Προβλέψεις κλάσης (benign ή malignant)
+rf_preds <- predict(rf_model, newdata = test_set)
+
+# 2. Confusion Matrix
+# Ορίζουμε positive = "malignant" γιατί αυτό μας ενδιαφέρει να μην χάσουμε
+cm <- confusionMatrix(rf_preds, test_set$Class, positive = "malignant")
+print(cm)
+
+# 3. Υπολογισμός AUC (Area Under the Curve)
+# Χρειαζόμαστε τις πιθανότητες για την ROC καμπύλη
+rf_probs <- predict(rf_model, newdata = test_set, type = "prob")[, "malignant"]
+roc_curve <- roc(test_set$Class, rf_probs)
+auc_value <- auc(roc_curve)
+
+# Εμφάνιση AUC και Σχεδίαση ROC
+print(paste("AUC:", auc_value))
+plot(roc_curve, col = "blue", main = paste("ROC Curve (AUC =", round(auc_value, 3), ")"))
+```
+
+Η αξιολόγηση του μοντέλου Random Forest στο σύνολο δεδομένων ελέγχου (test set) ανέδειξε μια εξαιρετική προγνωστική ικανότητα. Με Accuracy 97% και μια καμπύλη ROC που πλησιάζει τη μονάδα (AUC > 0.98), το μοντέλο αποδεικνύεται ικανό να διακρίνει με μεγάλη ακρίβεια τους κακοήθεις από τους καλοήθεις όγκους.
+
+Ιδιαίτερη έμφαση δόθηκε στην Ευαισθησία (Sensitivity), η οποία ξεπερνά το 95%, διασφαλίζοντας ότι ο αριθμός των ψευδώς αρνητικών αποτελεσμάτων (περιπτώσεις καρκίνου που διαφεύγουν της διάγνωσης) διατηρείται στο ελάχιστο δυνατό επίπεδο. Ο πίνακας συγχύσεως επιβεβαιώνει ότι το μοντέλο είναι εξαιρετικά "συνεπές" στις προβλέψεις του, καθιστώντας το ένα αξιόπιστο εργαλείο υποστήριξης κλινικών αποφάσεων.
+
+## Variable Importance plot
+
+Στον παρακάτω πίνακα, φαίνεται ξεκάθαρα ποια είναι τα κορυφαία 3 χαρακτηριστικά:
+
+```{r}
+varImpPlot(rf_model, main = "Σημαντικότητα Χαρακτηριστικών")
+
+# Εξαγωγή των top 3
+importance_scores <- as.data.frame(importance(rf_model))
+top_3 <- importance_scores %>% 
+  arrange(desc(MeanDecreaseGini)) %>% 
+  head(3)
+print(top_3)
+```
+
+## Συμπεράσματα
+
+1. Ποιο ήταν το Accuracy;
+Το Accuracy που προέκυψε είναι 97% (ή 0.971). Αυτό σημαίνει ότι το μοντέλο προβλέπει σωστά 97 στις 100 περιπτώσεις.
+
+2. Ποια ήταν τα top-3 features;
+
+Bare.nuclei
+
+Cell.size (Uniformity of Cell Size)
+
+Cell.shape (Uniformity of Cell Shape)
+
+3. Είναι 97% accuracy «αρκετό» σε ιατρικό context;
+Όχι απαραίτητα. Στην ιατρική, το Accuracy μπορεί να είναι παραπλανητικό. 
+
+Αυτό μπορούμε να το κατανοήσουμε με το εξής παράδειγμα: Αν έχουμε 100 ασθενείς και οι 3 έχουν καρκίνο, ένα μοντέλο που λέει σε όλους ότι είναι υγιής θα είχε 97% Accuracy, αλλά θα έχανε όλους τους καρκίνους!
+
+Αυτό που μας ενδιαφέρει πραγματικά είναι η Ευαισθησία (Sensitivity/Recall). Μπορούμε συνεπώς να πούμε, πως θα ήταν προτιμότερο ένα μοντέλο που μπορεί να κάνει 5 λάθος συναγερμούς (False Positives), αρκεί να μην χάσει ούτε έναν πραγματικό καρκίνο (False Negative). Επομένως, το 97% είναι εξαιρετικό μόνο αν συνοδεύεται από πολύ υψηλή Ευαισθησία.
+
+
+#  ΜΕΡΟΣ Β — BOOSTING & TUNING
+
+## Προετοιμάζουμε τα δεδομένα για XGBoost
+
+```{r}
+# as.matrix() + ifelse() για το target
+# Μετατροπή της κλάσης σε 0 και 1 (0 = benign, 1 = malignant)
+# Το XGBoost δέχεται μόνο αριθμητικά labels
+train_labs <- ifelse(train_set$Class == "malignant", 1, 0)
+test_labs  <- ifelse(test_set$Class == "malignant", 1, 0)
+
+# Μετατροπή των features σε matrix (αφαιρούμε τη στήλη Class)
+train_mat <- as.matrix(train_set[, -10])
+test_mat  <- as.matrix(test_set[, -10])
+
+# Δημιουργία DMatrix (βελτιστοποιημένη δομή δεδομένων για XGBoost)
+dtrain <- xgb.DMatrix(data = train_mat, label = train_labs)
+dtest  <- xgb.DMatrix(data = test_mat, label = test_labs)
+```
+
+## Εκπαιδεύουμε ένα XGBoost μοντέλο με early stopping
+
+```{r}
+# Παράμετροι: max_depth=4, eta=0.1, nrounds=500, early_stopping_rounds=20
+# Λίστα παρακολούθησης για να βλέπουμε το σφάλμα στο test set κατά την εκπαίδευση
+watchlist <- list(train = dtrain, test = dtest)
+
+# Εκπαίδευση μοντέλου
+xgb_model <- xgb.train(
+  params = list(
+    max_depth = 4,           # Βάθος δέντρου: 4 (ούτε πολύ απλό, ούτε πολύ σύνθετο)
+    eta = 0.1,               # Learning rate: 0.1 (πόσο γρήγορα "μαθαίνει")
+    objective = "binary:logistic" # Στόχος: Λογιστική παλινδρόμηση για binary classification
+  ),
+  data = dtrain,
+  nrounds = 500,             # Μέγιστος αριθμός δέντρων
+  early_stopping_rounds = 20,# Σταμάτα αν για 20 γύρους δεν έχουμε βελτίωση στο test set
+  watchlist = watchlist,
+  verbose = 1                # Εμφάνιση της προόδου
+)
+```
+
+Παρατηρούμε, πως ενώ δώσαμε περιθώριο 500 γύρων, το μοντέλο σταμάτησε στο 85 καθώς εκεί αποδείχθηκε ότι το μοντέλο σταμάτησε να βελτιώνεται στο train set.
+
+## Συγκρίνουμε XGBoost vs Random Forest σε έναν πίνακα
+
+```{r}
+# Στήλες: Accuracy, Sensitivity, Specificity, AUC
+# 1. Προβλέψεις από XGBoost (χρειαζόμαστε το best_iteration)
+xgb_probs <- predict(xgb_model, dtest)
+xgb_preds <- ifelse(xgb_probs > 0.5, 1, 0)
+# Μετατροπή σε factor για το confusionMatrix (με τα ίδια επίπεδα 0,1)
+xgb_preds_f <- factor(xgb_preds, levels = c(0, 1), labels = c("benign", "malignant"))
+
+# 2. Υπολογισμός μετρικών για XGBoost
+cm_xgb <- confusionMatrix(xgb_preds_f, test_set$Class, positive = "malignant")
+roc_xgb <- roc(test_labs, xgb_probs)
+
+# 3. Δημιουργία πίνακα σύγκρισης
+comparison_table <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "AUC"),
+  Random_Forest = c(cm$overall["Accuracy"], cm$byClass["Sensitivity"], cm$byClass["Specificity"], as.numeric(auc(roc_curve))),
+  XGBoost = c(cm_xgb$overall["Accuracy"], cm_xgb$byClass["Sensitivity"], cm_xgb$byClass["Specificity"], as.numeric(auc(roc_xgb)))
+)
+
+print(comparison_table)
+```
+
+## Δοκιμάζουμε δύο διαφορετικά eta (0.01 και 0.3)
+
+```{r}
+# Τι παρατηρείς για τον αριθμό γύρων που χρειάστηκε;
+# Δοκιμή με πολύ μικρό eta (0.01) - Ο "Προσεκτικός Περιπατητής"
+xgb_low_eta <- xgb.train(params = list(max_depth = 4, eta = 0.01, objective = "binary:logistic"),
+                         data = dtrain, nrounds = 1000, early_stopping_rounds = 20,
+                         watchlist = watchlist, verbose = 0)
+
+# Δοκιμή με μεγάλο eta (0.3) - Ο "Δρομέας"
+xgb_high_eta <- xgb.train(params = list(max_depth = 4, eta = 0.3, objective = "binary:logistic"),
+                          data = dtrain, nrounds = 1000, early_stopping_rounds = 20,
+                          watchlist = watchlist, verbose = 0)
+
+print(paste("Γύροι για eta 0.01:", xgb_low_eta$best_iteration))
+print(paste("Γύροι για eta 0.3:", xgb_high_eta$best_iteration))
+```
+
+## Κατασκευή ενός ROC plot με 2 καμπύλες
+
+```{r}
+# (RF και XGBoost) στο ίδιο γράφημα
+plot(roc_curve, col = "red", lwd = 2, main = "Σύγκριση ROC: RF vs XGBoost")
+plot(roc_xgb, add = TRUE, col = "blue", lwd = 2, lty = 2)
+
+legend("bottomright", 
+       legend = c(paste("Random Forest (AUC =", round(auc(roc_curve), 3), ")"),
+                  paste("XGBoost (AUC =", round(auc(roc_xgb), 3), ")")),
+       col = c("red", "blue"), 
+       lwd = 2, lty = c(1, 2))
+```
+
+## Συμπεράσματα
+
+1. Ποιο μοντέλο νίκησε; Με πόση διαφορά;
+Από το διάγραμμα δεν φαίνεται να υπάρχει κάποια ξεκάθαρη υπεροχή μεταξύ των δύο αυτών αλγορίθμων μηχανικής μάθησης. Πιο συγκεκριμένα, φαίνεται ελάχιστα καλύτερο το Random Forest με AUC 0.998 έναντι 0.997 του XGBoost.
+
+2. Σας εξέπληξε κάτι στα αποτελέσματα;
+Είναι σπάνιο δύο τόσο διαφορετικοί αλγόριθμοι να συμφωνούν τόσο απόλυτα. Αυτό δείχνει ότι τα δεδομένα των παθολόγων είναι πολύ "καθαρά". Παρατηρούμε επίσης ότι και τα δύο μοντέλα προτιμούν να κάνουν ένα "λάθος συναγερμό" (False Positive) παρά να χάσουν έναν καρκίνο. Αυτή η συμπεριφορά "εκπαιδεύτηκε" σωστά από τον αλγόριθμο.
+
+3. Τι παρατηρήσατε με τα διαφορετικά eta;
+Όσο μικραίνει το eta, τόσο αυξάνεται ο αριθμός των γύρων που χρειάζεται το Early Stopping για να σταματήσει. Είναι μια ανταλλαγή (trade-off) μεταξύ χρόνου εκπαίδευσης και ακρίβειας.
