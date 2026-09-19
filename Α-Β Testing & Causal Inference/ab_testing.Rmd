@@ -1,0 +1,421 @@
+---
+title: "A/B Testing & Causal Inference"
+author: "Michail Ioannidis"
+date: "2026-05-16"
+output: 
+  cleanrmd::html_document_clean:
+    theme: water-dark
+    toc: true
+    toc_float: true
+---
+
+Η ομάδα marketing θέλει να μάθει: **η νέα διαφήμιση αυξάνει πραγματικά τις μετατροπές (conversions) ή η διαφορά είναι τυχαία;**
+
+Τρέξατε ένα A/B test: μέρος των χρηστών είδε τη νέα διαφήμιση (*treatment: "ad"*), οι υπόλοιποι είδαν ένα ουδέτερο μήνυμα (*control: "psa"*).
+
+Η δουλειά σας είναι να αναλύσετε τα αποτελέσματα με στατιστική αυστηρότητα και να δώσετε **επιχειρηματικά τεκμηριωμένη σύσταση**.
+
+```{r}
+# ============================================================
+#  ΕΡΓΑΣΙΑ 010 — A/B Testing & Causal Inference
+#  Dataset: Marketing A/B Testing (Kaggle)
+#  Στόχος: Αξιολόγηση αποτελεσματικότητας διαφημιστικής καμπάνιας
+# ============================================================
+
+# --- Εγκατάσταση & Φόρτωση πακέτων ---
+#install.packages(c("tidyverse", "pwr", "broom", "scales", "janitor"))
+
+library(tidyverse)
+library(pwr)
+library(broom)
+library(scales)
+library(janitor)
+
+set.seed(42)
+
+# --- Φόρτωση δεδομένων ---
+ads <- read_csv("marketing_AB.csv") |>
+  janitor::clean_names() |>
+  mutate(
+    group     = factor(test_group, levels = c("psa", "ad")),
+    converted = as.integer(converted)
+  )
+
+glimpse(ads)
+```
+
+# Μέρος Α — Βασικός A/B Έλεγχος (Simulated Experiment)
+
+## Αρχική Διερεύνηση Dataset
+
+Το dataset Marketing A/B Testing περιέχει περίπου 588.000 παρατηρήσεις, γεγονός που μας δίνει τεράστια στατιστική ισχύ (statistical power).
+
+Η Δομή των Στηλών (Variables)
+
+1. **user_id**: Μοναδικό αναγνωριστικό για κάθε χρήστη.
+
+2. **test_group** (ή group): Η μεταβλητή του πειράματος. Χωρίζεται σε ad (treatment - είδαν τη νέα διαφήμιση) και psa (control - είδαν μια δημόσια ανακοίνωση/ουδέτερο μήνυμα).
+
+3. **converted**: Η μεταβλητή-στόχος (Binary: 0 ή 1). Δείχνει αν ο χρήστης έκανε τελικά τη μετατροπή (π.χ. αγόρασε το προϊόν, γράφτηκε στην υπηρεσία).
+
+4. **total_ads**: Ο συνολικός αριθμός διαφημίσεων που είδε ο συγκεκριμένος χρήστης.
+
+5. **most_ads_day**: Η ημέρα της εβδομάδας που ο χρήστης είδε τις περισσότερες διαφημίσεις.
+
+6. **most_ads_hour**: Η ώρα της ημέρας (0-23) που ο χρήστης είδε τις περισσότερες διαφημίσεις.
+
+```{r}
+# --- Αρχική Διερεύνηση του Dataset ---
+print("--- Δομή Δεδομένων ---")
+str(ads)
+
+print("--- Βασικά Στατιστικά ---")
+summary(ads)
+
+print("--- Κατανομή των Ομάδων (Imbalance Check) ---")
+table(ads$group)
+prop.table(table(ads$group)) |> round(3)
+
+print("--- Συνολικό Conversion Rate ανά Ομάδα ---")
+ads |> 
+  group_by(group) |> 
+  summarize(
+    total_users = n(),
+    conversions = sum(converted),
+    conversion_rate = mean(converted)
+  )
+```
+
+
+## Simulated A/B Test
+
+```{r}
+# --- Παράμετροι πειράματος ---
+n_control   <- 8000      # μέγεθος ομάδας ελέγχου
+n_treatment <- 8000      # μέγεθος πειραματικής ομάδας
+p_control   <- 0.08      # baseline conversion rate
+p_treatment <- 0.10      # μετά την αλλαγή (true effect = +2%)
+
+
+# TODO 1: Δημιουργία του Dataframe 'experiment'
+#   Δημιουρεγία ενός tibble «experiment» με στήλες:
+#   user_id (αύξων αριθμός 1 ... n_control+n_treatment)
+#   group   ("control" ή "treatment")
+#   converted (0/1 — χρησιμοποίησε rbinom())
+#   rbinom(n, 1, p) επιστρέφει vector από 0/1
+experiment <- tibble(
+  user_id = 1:(n_control + n_treatment),
+  group   = factor(c(rep("control", n_control), rep("treatment", n_treatment)), 
+                   levels = c("control", "treatment")),
+  converted = c(rbinom(n_control, 1, p_control), 
+                rbinom(n_treatment, 1, p_treatment))
+)
+
+# TODO 2: Υπολογισμός ανά ομάδα: n, conversions, conversion_rate,
+#   standard error (se) και 95% CI (ci_lower, ci_upper)
+#   Αποθήκευση σε tibble «summary_stats»
+summary_stats <- experiment |>
+  group_by(group) |>
+  summarize(
+    n = n(),
+    conversions = sum(converted),
+    conversion_rate = mean(converted),
+    # Τύπος Standard Error για αναλογίες: SE = sqrt(p*(1-p)/n)
+    se = sqrt((conversion_rate * (1 - conversion_rate)) / n),
+    # 95% Διάστημα Εμπιστοσύνης (Z = 1.96)
+    ci_lower = conversion_rate - 1.96 * se,
+    ci_upper = conversion_rate + 1.96 * se,
+    .groups = "drop"
+  )
+print(summary_stats)
+```
+
+Αρχικά, παρατηρούμε ότι για το Conversion Rate, έχουμε πετύχει 8.46% για την ομάδα ελέγχου (control) και για την πειραματική (treatment) 9.55%. Αυτό δείχνει μια εμφανή αύξηση 1.09%.
+
+Από την άλλη, το Standard Error (se): Είναι πολύ μικρό (~0.003) και για τις δύο ομάδες. Αυτό συμβαίνει επειδή το δείγμα μας ($n = 8000$) είναι αρκετά μεγάλο, πράγμα που σημαίνει ότι οι εκτιμήσεις μας είναι πολύ σταθερές.
+
+Τέλος, τα διαστήματα εμπιστοσύνης, κινούνται ως εξής: (ci_lower / ci_upper): 
+Control: [7.85% - 9.07%] και Treatment: [8.91% - 10.2%]
+
+```{r}
+# TODO 3: Οπτικοποίησh με ggplot2 (geom_col + geom_errorbar)
+#   φαίνεται καθαρά ποια ομάδα έχει υψηλότερο conversion rate
+#   Χρησιμοποιούμε scale_y_continuous(labels = percent)
+ggplot(summary_stats, aes(x = group, y = conversion_rate, fill = group)) +
+  geom_col(alpha = 0.8, width = 0.6, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                width = 0.15, color = "black", size = 0.8) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Σύγκριση Conversion Rates (Προσομοίωση)",
+    subtitle = "Με διαστήματα εμπιστοσύνης 95% (95% CI Error Bars)",
+    x = "Ομάδα Πειράματος",
+    y = "Conversion Rate (%)"
+  ) +
+  scale_fill_manual(values = c("control" = "#E64B35B2", "treatment" = "#4DBBD5B2"))
+```
+
+Σε αυτό το διάγραμμα, μπορεί πολλοί να θεωρήσουν πως η επικάλυψη (overlap) που γίνεται (δηλαδή ότι το πάνω μέρος του error bar του Control (9.07%) είναι ελαφρώς πιο ψηλά από το κάτω μέρος του Treatment (8.91%).). Δηλαδή υπάρχει μια επικάλυψη.
+
+Αυτό που πρέπει να τεθεί σε προσοχή, είναι πως το γεγονός ότι τέμνονται μπορεί να είναι και συμπτωματικό. Η επικάλυψη των μεμονωμένων διαστημάτων δεν σημαίνει απαραίτητα αποτυχία. Αυτό που μας ενδιαφέρει είναι το διάστημα εμπιστοσύνης της διαφοράς τους, το οποίο θα υπολογίσουμε τώρα με το prop.test().
+
+```{r}
+# Ανάκτηση των απαραίτητων στοιχείων από τον summary_stats για ευκολία
+x_treatment <- 764
+x_control   <- 677
+n_treatment <- 8000
+n_control   <- 8000
+
+# TODO 4: Διεξάγουμε έλεγχο υποθέσεων με prop.test()
+#   Χρησιμοποιούμε correct = FALSE (χωρίς Yates correction)
+#   Αποθηκεύουμε το αποτέλεσμα σε «test_result»
+#Είναι ο κλασικός στατιστικός έλεγχος δύο αναλογιών (Z-test). Ελέγχει την υπόθεση αν η διαφορά που είδαμε (1.09%) είναι πραγματική ή αν προέκυψε από τύχη. Κοιτάμε p-value
+conversions_vector <- c(x_treatment, x_control)
+n_vector           <- c(n_treatment, n_control)
+
+test_result <- prop.test(x = conversions_vector, n = n_vector, correct = FALSE)
+
+print("--- Αποτελέσματα prop.test() ---")
+print(test_result)
+```
+
+Το p-value απαντάει στην ερώτηση: «Αν η νέα διαφήμιση ήταν εντελώς άχρηστη, ποια είναι η πιθανότητα να βλέπαμε μια τέτοια διαφορά κατά τύχη;».
+
+Η πιθανότητα είναι μόλις 1.6% (0.01628). Επειδή το 1.6% είναι μικρότερο από το κλασικό όριο του 5% (α = 0.05), απορρίπτουμε τη θεωρία της τυχαιότητας. Η διαφορά είναι στατιστικά σημαντική. Η νέα διαφήμιση όντως λειτουργεί.
+
+```{r}
+# TODO 5: Χειρωνακτική επαλήθευση — υπολογίζουμε:
+#   (α) pooled estimate p̂_pool
+p_hat_treatment <- x_treatment / n_treatment
+p_hat_control   <- x_control / n_control
+
+p_pool <- (x_treatment + x_control) / (n_treatment + n_control)
+
+#   (β) pooled SE
+se_pool <- sqrt(p_pool * (1 - p_pool) * (1/n_treatment + 1/n_control))
+
+#   (γ) δ = p_treatment - p_control
+delta <- p_hat_treatment - p_hat_control
+
+#   (δ) 95% CI για τη διαφορά δ
+#   Συγκρίνουμε με το CI του prop.test()
+se_diff <- sqrt((p_hat_treatment * (1 - p_hat_treatment) / n_treatment) + 
+                (p_hat_control * (1 - p_hat_control) / n_control))
+
+z_critical <- 1.96
+ci_diff_lower <- delta - (z_critical * se_diff)
+ci_diff_upper <- delta + (z_critical * se_diff)
+
+print("--- Χειρωνακτική Επαλήθευση ---")
+cat("p_pool:", p_pool, "\n")
+cat("Pooled SE:", se_pool, "\n")
+cat("Διαφορά (Delta):", delta, "\n")
+cat("95% CI της διαφοράς: [", ci_diff_lower, ",", ci_diff_upper, "]\n\n")
+```
+
+Επειδή δουλεύουμε με δείγμα, δεν μπορούμε να είμαστε 100% σίγουροι για το ακριβές 1.09%. Το διάστημα εμπιστοσύνης μάς λέει ότι ο πραγματικός αντίκτυπος της διαφήμισης στην αγορά θα κυμαίνεται μεταξύ +0.20% (χειρότερο σενάριο) και +1.97% (καλύτερο σενάριο).
+
+Το διάστημα δεν περιέχει το μηδέν (0) και οι δύο τιμές είναι θετικές. Αυτό σημαίνει ότι ακόμη και στο χειρότερο σενάριο, η νέα καμπάνια θα έχει θετικό πρόσημο.
+
+```{r}
+# TODO 6: Power Analysis — υπολογίζουμε με pwr.2p.test()
+#   Πόσο δείγμα χρειαζόταν πραγματικά για power = 80% και α = 0.05;
+#   ES.h(p1 = 0.10, p2 = 0.08) δίνει το Cohen's h
+#Η ανάλυση ισχύος (Power Analysis) μας απαντάει στο εξής ερώτημα: «Πριν ξεκινήσω το πείραμα, πόσους χρήστες έπρεπε να βάλω σε κάθε ομάδα ώστε να έχω 80% πιθανότητα να πετύχω το true effect (+2%), αν αυτό όντως υπάρχει;». Κοιτάμε την τιμή n που θα επιστρέψει το test.
+cohens_h <- ES.h(p1 = 0.10, p2 = 0.08)
+
+power_analysis <- pwr.2p.test(h = cohens_h, 
+                              sig.level = 0.05, 
+                              power = 0.80)
+
+print("--- Αποτελέσματα Power Analysis ---")
+print(power_analysis)
+```
+
+To n, μάς λέει πόσους χρήστες χρειαζόμασταν κατά ελάχιστο σε κάθε ομάδα για να είμαστε 80% σίγουροι ότι θα εντοπίσουμε αυτή την αύξηση του +2%.
+
+Χρειαζόμασταν τουλάχιστον 3.205 χρήστες ανά ομάδα. Εφόσον εμείς στο πείραμά μας χρησιμοποιήσαμε 8.000 χρήστες ανά ομάδα, το πείραμά μας είναι απόλυτα έγκυρο, ασφαλές και είχε την απαραίτητη στατιστική ισχύ (statistical power) για να βγάλει σωστό συμπέρασμα.
+
+
+# Μέρος Β — Πραγματικά Δεδομένα
+
+```{r}
+# ============================================================
+#  ΜΕΡΟΣ Β — Real-World A/B Analysis
+# ============================================================
+
+# TODO 7: Invariants check — ελέγχουμε αν η τυχαιοποίηση δούλεψε
+#   (α) Ποια η αναλογία ad/psa; Είναι 50/50;
+group_table <- ads |> 
+  count(group) |> 
+  mutate(percentage = n / sum(n))
+
+print("--- Αναλογία Ομάδων ---")
+print(group_table)
+
+#   (β) Οπτικοποιούμε την κατανομή ανά ημέρα εβδομάδας (most_ads_day)
+#       για κάθε ομάδα — ψάχνουμε ανισορροπίες
+day_dist <- ads |>
+  count(group, most_ads_day) |>
+  group_by(group) |>
+  mutate(prop_day = n / sum(n)) |>
+  ungroup()
+
+# Ορίζουμε τη σωστή σειρά των ημερών για το γράφημα
+days_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+day_dist <- day_dist |> mutate(most_ads_day = factor(most_ads_day, levels = days_order))
+
+# Οπτικοποίηση
+ggplot(day_dist, aes(x = most_ads_day, y = prop_day, fill = group)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Invariants Check: Κατανομή Χρηστών ανά Ημέρα",
+       x = "Ημέρα", y = "Ποσοστό Χρηστών στην Ομάδα (%)") +
+  theme_minimal() +
+  scale_fill_manual(values = c("psa" = "#E64B35B2", "ad" = "#4DBBD5B2"))
+```
+
+Στην αναλογία, παρατηρούμε ότι δεν είναι 50/50. Η ομάδα ad είναι περίπου το 96% του δείγματος και η psa το 4%. Παρόλο που αυτό μπορεί αρχικά να ξαφνιάζει, είναι μια συνηθισμένη business στρατηγική (Holdout group). Η εταιρεία δεν ήθελε να χάσει έσοδα κρατώντας το 50% των χρηστών χωρίς τη νέα διαφήμιση. Στατιστικά είναι έγκυρο, αρκεί η κατανομή ανά ημέρα να είναι ίδια.
+
+Στο Conversion Rate, η ομάδα psa έχει baseline μετατροπές 1.79%, ενώ η ομάδα ad φτάνει στο 2.55%.
+
+Όσον αφορά το Bar Plot, Οι μπάρες του ad και του psa πρέπει να έχουν το ίδιο ύψος για κάθε ημέρα. Αν οι μπάρες συμπίπτουν, ο αλγόριθμος τυχαιοποίησης δούλεψε σωστά και δεν έχουμε επιλογή μεροληψίας (selection bias). Και όπως παρατηρούμε, οι διαφορές είναι ελάχιστες, σε πολλές περιπτώσεις <1%. Συνεπώς, δεν υπάρχει καμία μεροληψία επιλογής ως προς τις ημέρες και οι χρήστες μοιράστηκαν στις δύο ομάδες περίπου με τις ίδιες ακριβώς αναλογίες κάθε μέρα.
+
+```{r}
+# TODO 8: Υπολογίζουμε conversion rate, SE, 95% CI ανά ομάδα
+#   Διεξάγουμε prop.test() και χρησιμοποιούμε broom::tidy()
+#   για μορφοποιημένο output
+# 1. Υπολογισμός βασικών μετρικών ανά ομάδα
+real_summary <- ads |>
+  group_by(group) |>
+  summarize(
+    n = n(),
+    conversions = sum(converted),
+    conversion_rate = mean(converted),
+    se = sqrt((conversion_rate * (1 - conversion_rate)) / n),
+    ci_lower = conversion_rate - 1.96 * se,
+    ci_upper = conversion_rate + 1.96 * se,
+    .groups = "drop"
+  )
+
+print("--- Στατιστικά Σύνοψης Πραγματικών Δεδομένων ---")
+print(real_summary)
+
+# 2. prop.test() και μορφοποίηση με broom::tidy()
+# Απομονώνουμε τα vectors για το τεστ (πρώτα η ομάδα ad για θετική διαφορά)
+conv_vector <- c(real_summary$conversions[real_summary$group == "ad"], 
+                 real_summary$conversions[real_summary$group == "psa"])
+n_vector    <- c(real_summary$n[real_summary$group == "ad"], 
+                 real_summary$n[real_summary$group == "psa"])
+
+real_test <- prop.test(x = conv_vector, n = n_vector, correct = FALSE)
+real_test_tidy <- broom::tidy(real_test)
+
+print("--- Μορφοποιημένα Αποτελέσματα prop.test() ---")
+print(real_test_tidy)
+```
+
+Κοιτώντας το p-value, το οποίο είναι σχεδόν μηδενικό (1.71e-13) και ουσιαστικά απέχει πάρα πολύ από το στατιστικό όριο του 0.05 (5%), απορρίπτουμε κατηγορηματικά την Μηδενική Υπόθεση. Συμπερασματικά, αποκλείεται η αύξηση αυτή να οφείλεται στην τύχη ή σε στατιστικό θόρυβο. Η νέα διαφήμιση προκαλεί ξεκάθαρα περισσότερα conversions.
+
+```{r}
+# TODO 9: Segmentation — conversion rate ανά ημέρα εβδομάδας
+#   Φτιάχνουμε line plot με ribbon (95% CI) για κάθε ομάδα
+#   Hint: geom_ribbon(aes(ymin = ..., ymax = ...), alpha = 0.15)
+#   Ποια ημέρα έχει τη μεγαλύτερη διαφορά μεταξύ ομάδων;
+day_summary <- ads |>
+  group_by(group, most_ads_day) |>
+  summarize(
+    n = n(),
+    conversions = sum(converted),
+    cr = mean(converted),
+    se = sqrt((cr * (1 - cr)) / n),
+    ci_lower = cr - 1.96 * se,
+    ci_upper = cr + 1.96 * se,
+    .groups = "drop"
+  ) |>
+  mutate(most_ads_day = factor(most_ads_day, levels = days_order))
+
+# Line plot με geom_ribbon για τα διαστήματα εμπιστοσύνης
+ggplot(day_summary, aes(x = most_ads_day, y = cr, group = group, color = group, fill = group)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.15, color = NA) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Conversion Rate ανά Ημέρα με 95% Διαστήματα Εμπιστοσύνης",
+       x = "Ημέρα της Εβδομάδας", y = "Conversion Rate (%)") +
+  theme_minimal() +
+  scale_color_manual(values = c("psa" = "#E64B35", "ad" = "#4DBBD5")) +
+  scale_fill_manual(values = c("psa" = "#E64B35", "ad" = "#4DBBD5"))
+```
+
+Το line plot δείχνει τη διακύμανση του Conversion Rate κατά τη διάρκεια της εβδομάδας, μαζί με τα 95% Διαστήματα Εμπιστοσύνης (σύννεφα Ribbon). 
+1. Η μπλε γραμμή (ad) βρίσκεται σταθερά και μόνιμα πιο ψηλά από την κόκκινη γραμμή (psa) σε όλες τις ημέρες της εβδομάδας.
+2. Τα "σύννεφα" (Ribbons) των δύο ομάδων δεν τέμνονται πουθενά. Αυτό αποτελεί οπτική επιβεβαίωση της στατιστικής σημαντικότητας για κάθε ημέρα ξεχωριστά.
+3. Το ribbon της ομάδας psa είναι εμφανώς πιο παχύ από της ad. Αυτό εξηγείται μαθηματικά: επειδή η psa έχει μικρότερο δείγμα ($n = 23.524$), το Standard Error είναι μεγαλύτερο, άρα έχουμε ελαφρώς μεγαλύτερη αβεβαιότητα στην εκτίμηση.
+
+Ημέρα με τη μεγαλύτερη διαφορά: Η μεγαλύτερη απόσταση μεταξύ των δύο γραμμών εντοπίζεται την Τρίτη (Tuesday). Εκεί η διαφήμιση παρουσιάζει το μέγιστο lift, καθιστώντας την Τρίτη την πιο αποδοτική ημέρα για την καμπάνια.
+
+```{r}
+# TODO 10 Επιχειρηματική απόφαση
+#   Ορίζουμε δ_min = 0.005 (κατώφλι επιχειρηματικής ουσίας)
+#   Υπολογίζουμε το absolute lift και το relative lift
+#   Ποια από τις 6 περιπτώσεις CI ισχύει; (A/B/C/D/E/F)
+#   Ποια η τελική σύσταση;
+cr_ad  <- real_summary$conversion_rate[real_summary$group == "ad"]
+cr_psa <- real_summary$conversion_rate[real_summary$group == "psa"]
+delta_min <- 0.005 # Κατώφλι 0.5%
+
+# Υπολογισμός lifts
+absolute_lift <- cr_ad - cr_psa
+relative_lift <- absolute_lift / cr_psa
+
+# Ανάκτηση των ορίων του CI για τη διαφορά από το tidy output
+ci_diff_lower <- real_test_tidy$conf.low
+ci_diff_upper <- real_test_tidy$conf.high
+
+cat("\n--- Business Metrics ---\n")
+cat("Absolute Lift:", round(absolute_lift, 5), "(", round(absolute_lift * 100, 2), "% απόλυτη αύξηση)\n")
+cat("Relative Lift:", round(relative_lift * 100, 2), "%\n")
+cat("95% CI της Διαφοράς: [", round(ci_diff_lower, 5), ",", round(ci_diff_upper, 5), "]\n")
+```
+
+Με βάση τα τελικά business metrics:
+
+Absolute Lift = 0.00769 (0.77% απόλυτη αύξηση): Το conversion rate αυξήθηκε κατά 0.77 ποσοστιαίες μονάδες.
+
+Relative Lift = 43.09%:Η νέα διαφήμιση βελτίωσε την απόδοση του conversion funnel κατά 43% σε σχέση με το baseline της εταιρείας!
+
+95% CI της Διαφοράς: [0.00595, 0.00943] (δηλαδή 0.60% έως 0.94%): Είμαστε 95% βέβαιοι ότι σε καθολική κλίμακα, η διαφορά θα κυμανθεί ανάμεσα σε αυτές τις δύο τιμές.
+
+# Επιπλέον απαντήσεις σε ερωτήματα
+
+## 1. Ποιο είναι το p-value του ελέγχου; Απορρίπτουμε την H₀ σε επίπεδο α = 0.05;
+
+Σύμφωνα με το output του prop.test(), το p-value είναι 0.01628. Η απόφαση είναι πως, ναι, απορρίπτουμε τη Μηδενική Υπόθεση ($H_0$) σε επίπεδο σημαντικότητας $\alpha = 0.05$, καθώς $0.01628 < 0.05$.
+
+Η Μηδενική Υπόθεση πρεσβεύει ότι η νέα διαφήμιση δεν έχει καμία επίδραση και ότι η διαφορά μεταξύ των δύο ομάδων είναι μηδενική. Το p-value μάς λέει ότι, αν η $H_0$ ίσχυε, η πιθανότητα να παρατηρήσουμε κατά τύχη μια τόσο μεγάλη (ή ακόμα μεγαλύτερη) διαφορά στις μετατροπές είναι μόλις 1.63%. Επειδή αυτή η πιθανότητα είναι εξαιρετικά μικρή (κάτω από το όριο του 5%), συμπεραίνουμε με ασφάλεια ότι η διαφορά που είδαμε είναι πραγματική και οφείλεται στη νέα διαφήμιση.
+
+## 2. Συμπίπτει το χειρωνακτικό CI με αυτό του prop.test(); Αν όχι, γιατί;
+
+Το αποτέλεσμα: Διάστημα prop.test(): [0.002005125 , 0.019744875]. Το Χειρωνακτικό Διάστημα ήταν: [0.002004962 , 0.019745040]. Δεν συμπίπτουν απόλυτα. Αν και οι τιμές είναι πάρα πολύ κοντά (ταυτίζονται μέχρι το 5ο δεκαδικό ψηφίο), διαφέρουν ελάχιστα στο 6ο και 7ο δεκαδικό ψηφίο.
+
+Στατιστική Αιτιολόγηση: Η διαφορά οφείλεται στο γεγονός ότι χρησιμοποιήθηκαν δύο διαφορετικές μαθηματικές προσεγγίσεις: Το Χειρωνακτικό CI υπολογίστηκε με την κλασική μέθοδο Wald ($\Delta \pm Z \times SE_{diff}$), η οποία χρησιμοποιεί την τυπική κανονική κατανομή και προϋποθέτει ότι το Standard Error παραμένει σταθερό και στην ίδια τιμή σε όλο το εύρος του διαστήματος.Η συνάρτηση prop.test() (ακόμη και με correct = FALSE) δεν χρησιμοποιεί τη μέθοδο Wald. Χρησιμοποιεί το Score Διάστημα Εμπιστοσύνης (τύπου Wilson Score για δύο δείγματα). Η Score μέθοδος βασίζεται στην αναστροφή του στατιστικού ελέγχου Score και επαναϋπολογίζει τη διακύμανση σε κάθε σημείο του διαστήματος. Θεωρείται ακαδημαϊκά και στατιστικά πολύ πιο ακριβής από τη Wald, ειδικά όταν οι αναλογίες πλησιάζουν τα άκρα (0 ή 1) ή όταν τα δείγματα έχουν συγκεκριμένες ιδιαιτερότητες.
+
+## 3. Πόσα άτομα χρειαζόντουσαν για power 80%; Πόσα τρέξαμε; Τι συνεπάγεται αυτό; 
+
+Το Power Analysis (pwr.2p.test) έδειξε ότι χρειαζόμασταν 3.205 άτομα ανά ομάδα (συνολικά 6.410 χρήστες). Στο πείραμα χρησιμοποιήθηκαν 8.000 άτομα ανά ομάδα (συνολικά 16.000 χρήστες).
+
+Αυτό συνεπάγεται με: 
+
+1. Overpowered Experiment (Υπερ-ισχυρό πείραμα): Το δείγμα μας ήταν σχεδόν 2.5 φορές μεγαλύτερο από το ελάχιστο απαιτούμενο. Αυτό σημαίνει ότι η πραγματική στατιστική ισχύς (Power) του πειράματός μας δεν ήταν 80%, αλλά άγγιζε το ~97%.
+2. Ελαχιστοποίηση του Σφάλματος Τύπου ΙΙ (False Negative): Η πιθανότητα να αποτύχουμε να εντοπίσουμε το true effect του +2% (αν αυτό υπήρχε) μειώθηκε από το προγραμματισμένο 20% σε λιγότερο από 3%. Ήμασταν σχεδόν βέβαιοι ότι αν η διαφήμιση δουλεύει, θα το βλέπαμε.
+3. Υψηλότερη Ακρίβεια (Στενότερα CIs): Λόγω του μεγαλύτερου δείγματος ($n=8000$ αντί για $3205$), το Standard Error συμπιέστηκε. Αυτό οδήγησε σε ένα πολύ πιο "στενό" και ακριβές διάστημα εμπιστοσύνης, δίνοντας μεγαλύτερη σιγουριά για το μέγεθος της επιτυχίας.
+4. Επιχειρηματικό Κόστος (Resource Waste): Από την πλευρά της επιχειρηματικής αποτελεσματικότητας, η startup "ξόδεψε" άσκοπα traffic χρηστών. Θα μπορούσε να είχε σταματήσει το πείραμα πολύ νωρίτερα (μόλις συμπληρώνονταν οι 3.205 χρήστες ανά ομάδα), να γλιτώσει χρόνο και χρήμα και να προχωρήσει στο καθολικό rollout (παραγωγή) της νέας διαφήμισης ταχύτερα.
+
+# Τελικά Συμπεράσματα Αξιολόγησης A/B TEST
+
+Μετά από στατιστικό έλεγχο σε δείγμα ~588.000 χρηστών, η νέα διαφημιστική καμπάνια (ad) πέτυχε εξαιρετικά αποτελέσματα, αυξάνοντας το Conversion Rate από 1.79% σε 2.55%.
+
+Η διαφορά είναι ακραία στατιστικά σημαντική (p-value = 1.71e-13) και μεταφράζεται σε Relative Lift +43.09%. Επιπλέον, το 95% Διάστημα Εμπιστοσύνης της διαφοράς [0.60% - 0.94%] βρίσκεται εξ ολοκλήρου πάνω από το κατώφλι επιχειρηματικής ουσίας (δ_min = 0.50%), εξαλείφοντας το οικονομικό ρίσκο. Η ανάλυση ανά ημέρα έδειξε ότι η καμπάνια υπερέχει σταθερά όλη την εβδομάδα, με κορύφωση την ημέρα Τρίτη.
+
+Προτείνεται το άμεσο και καθολικό rollout της νέας διαφημιστικής καμπάνιας στην παραγωγή.
